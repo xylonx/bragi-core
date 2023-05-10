@@ -36,6 +36,8 @@ config = { version = "0.13.3", default-features = false, features = ["toml"] }
 reqwest_cookie_store = "0.5.0"
 cookie = "0.17.0"
 clap = { version = "4.1.10", features = ["derive"] }
+html-escape = "0.2.13"
+serde_json = "1.0.94"
 
 [build-dependencies]
 tonic-build = "0.8"
