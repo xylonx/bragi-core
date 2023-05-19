@@ -1,80 +1,89 @@
-use std::{
-    fs,
-    io::{BufRead, BufReader},
-    path::PathBuf,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::{bail, Context, Result};
-use log::info;
-use parking_lot::RwLock;
+use anyhow::{Context, Result};
+use log::warn;
 use reqwest::{
     cookie::{CookieStore, Jar},
     header::HeaderValue,
     Url,
 };
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncWriteExt},
+};
 
-pub enum PersistMode {
-    Sync { cookie_path: PathBuf },
-    Async { cookie_path: PathBuf },
-}
+pub struct AsyncPersistCookieStore(Arc<InternalPersistCookieStore>);
 
-pub struct PersistCookieStore<'a>(RwLock<InternalPersistCookieStore<'a>>);
-
-impl<'a> PersistCookieStore<'a> {
+impl AsyncPersistCookieStore {
     // setting persist to none means non-persist
-    pub fn new(url: Url, persist: Option<PathBuf>) -> Result<Self> {
-        let internal = InternalPersistCookieStore {
+    pub async fn new(url: Url, cookie_path: PathBuf) -> Result<Self> {
+        let internal = Arc::new(InternalPersistCookieStore {
             jar: Jar::default(),
             url,
-            cookie_path: None,
-        };
+            cookie_path,
+        });
 
-        if let Some(cookie_path) = persist {
-            let file = match cookie_path.exists() {
-                false => {
-                    info!("cookie file {:?} not exists. create it", cookie_path);
-                    if let Some(p) = cookie_path.parent() {
-                        if !p.exists() {
-                            info!(
-                                "cookie file parent dir {:?} not exists. create it",
-                                cookie_path
-                            );
-                            fs::create_dir_all(p)
-                                .with_context(|| "create cookie file parent dir failed")?;
-                        }
+        internal.load().await?;
+
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        tokio::spawn({
+            let internal = internal.clone();
+            async move {
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = internal.clone().write_back().await {
+                        warn!(
+                            "[AsyncPersistCookieStore] failed to write cookie back to file: {}",
+                            e
+                        );
                     }
-                    fs::File::create(cookie_path).with_context(|| "create cookie file failed")?
                 }
-                true => fs::File::open(cookie_path).with_context(|| "open cookie file failed")?,
-            };
+            }
+        });
 
-            BufReader::new(file)
-                .lines()
-                .try_for_each(|c| match c {
-                    Ok(cookie) => Ok(internal.jar.add_cookie_str(cookie.as_str(), &internal.url)),
-                    Err(e) => bail!("read line from cookie failed: {}", e),
-                })
-                .with_context(|| "load cookie from file failed")?;
-        }
-
-        Ok(Self(RwLock::new(internal)))
+        Ok(Self(internal))
     }
 }
 
-impl<'a> CookieStore for PersistCookieStore<'a> {
+impl CookieStore for AsyncPersistCookieStore {
     fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &HeaderValue>, url: &Url) {
-        self.0.write().jar.set_cookies(cookie_headers, url);
-        // TODO(xylonx): persist cookies back to file
+        self.0.jar.set_cookies(cookie_headers, url);
     }
 
     fn cookies(&self, url: &Url) -> Option<HeaderValue> {
-        self.0.read().jar.cookies(url)
+        self.0.jar.cookies(url)
     }
 }
 
 // NOTE(xylonx): jar.cookies() will just give the while cookie string joined by "; ". consider to replace it
-struct InternalPersistCookieStore<'a> {
+struct InternalPersistCookieStore {
     jar: Jar,
     url: Url,
-    cookie_path: Option<&'a PathBuf>,
+    cookie_path: PathBuf,
+}
+
+impl InternalPersistCookieStore {
+    pub async fn load(&self) -> Result<()> {
+        let mut f = File::open(self.cookie_path.as_path())
+            .await
+            .with_context(|| format!("open cookie file {:?} failed", self.cookie_path))?;
+        let mut buf = String::new();
+        f.read_to_string(&mut buf).await?;
+        buf.split("; ").for_each(|c| {
+            self.jar.add_cookie_str(c, &self.url);
+        });
+        Ok(())
+    }
+
+    pub async fn write_back(&self) -> Result<()> {
+        let mut file = File::create(self.cookie_path.as_path()).await?;
+        file.write_all(
+            self.jar
+                .cookies(&self.url)
+                .map_or("".as_bytes().to_vec(), |c| c.as_bytes().to_vec())
+                .as_slice(),
+        )
+        .await?;
+        Ok(())
+    }
 }
