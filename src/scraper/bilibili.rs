@@ -22,21 +22,25 @@
 /// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 /// SOFTWARE.
 ///
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, matches, sync::Arc, time::Duration};
 
-use anyhow::{bail, Context, Ok, Result};
+use anyhow::{anyhow, bail, Context, Ok, Result};
 use async_trait::async_trait;
 use lazy_static::lazy_static;
 use log::info;
-use reqwest::{cookie::CookieStore, Client, Method, Request, Url};
+use reqwest::{cookie::CookieStore, Method, Request, Url};
 use serde::{Deserialize, Deserializer};
 use serde_repr::Deserialize_repr;
-use tower::{limit::RateLimit, Service, ServiceExt};
 
-use crate::bragi::{
-    detail_replay::detail_item::Item as DetailItem, search_replay::search_item::Item as SearchItem,
-    Image, Provider, SearchZone, Stream, TrackCollection, TrackCollectionDetail, TrackInfo,
-    UserDetail, UserInfo,
+use crate::{
+    bragi::{
+        detail_response::{detail_item, DetailItem},
+        search_response::{search_item, SearchItem},
+        stream_response::StreamItem,
+        suggest_response::Suggestion,
+        Artist, ArtistDetail, Image, Playlist, PlaylistDetail, Provider, Stream, Track, Zone,
+    },
+    utils::request::LimitedRequestClient,
 };
 
 use super::Scraper;
@@ -157,10 +161,10 @@ struct BiliUser {
     // upic for search while face for detail
     avatar_url: String,
 }
-impl From<BiliUser> for SearchItem {
+impl From<BiliUser> for search_item::Item {
     fn from(u: BiliUser) -> Self {
-        Self::User(UserDetail {
-            info: Some(UserInfo {
+        search_item::Item::User(ArtistDetail {
+            artist: Some(Artist {
                 id: u.id.to_string(),
                 provider: Provider::Bilibili.into(),
                 name: u.name,
@@ -174,9 +178,10 @@ impl From<BiliUser> for SearchItem {
         })
     }
 }
-impl Into<UserInfo> for BiliUser {
-    fn into(self) -> UserInfo {
-        UserInfo {
+
+impl Into<Artist> for BiliUser {
+    fn into(self) -> Artist {
+        Artist {
             id: self.id.to_string(),
             provider: Provider::Bilibili.into(),
             name: self.name,
@@ -184,10 +189,10 @@ impl Into<UserInfo> for BiliUser {
     }
 }
 
-impl Into<UserDetail> for BiliUser {
-    fn into(self) -> UserDetail {
-        UserDetail {
-            info: Some(UserInfo {
+impl Into<ArtistDetail> for BiliUser {
+    fn into(self) -> ArtistDetail {
+        ArtistDetail {
+            artist: Some(Artist {
                 id: self.id.to_string(),
                 provider: Provider::Bilibili.into(),
                 name: self.name,
@@ -203,7 +208,7 @@ struct BiliVideoDetail {
     #[serde(rename = "bvid")]
     id: String,
     #[serde(rename = "videos")]
-    video_numbers: u32, // identity video collection
+    video_number: u32, // identity video collection
     // pic here contains scheme like "http://i0.hdslb.com/bfs/archive/c8d195be7b79b63879d306f6aaffdb2dea485b95.jpg". so just use it
     #[serde(rename = "pic")]
     cover_url: String,
@@ -226,9 +231,9 @@ struct BiliVideoDetailItem {
     title: String,
 }
 
-impl Into<TrackInfo> for BiliVideoDetail {
-    fn into(self) -> TrackInfo {
-        TrackInfo {
+impl Into<Track> for BiliVideoDetail {
+    fn into(self) -> Track {
+        Track {
             id: trackid_from(self.id, self.cid.to_string()),
             provider: Provider::Bilibili.into(),
             name: self.title,
@@ -242,46 +247,41 @@ impl Into<TrackInfo> for BiliVideoDetail {
     }
 }
 
-impl Into<TrackCollection> for BiliVideoDetail {
-    fn into(self) -> TrackCollection {
-        let user_infos: Vec<UserInfo> = vec![self.author]
+impl Into<Playlist> for BiliVideoDetail {
+    fn into(self) -> Playlist {
+        let user_infos: Vec<Artist> = vec![self.author]
             .into_iter()
             .chain(self.partner.into_iter().flatten())
             .map(|i| i.into())
             .collect();
         let cover = Image::from(self.cover_url);
-        TrackCollection {
+        Playlist {
             id: self.id.clone(),
             provider: Provider::Bilibili.into(),
             name: self.title,
-            authors: user_infos.clone(),
+            artists: user_infos.clone(),
             cover: Some(cover.clone()),
-            tracks: self
-                .videos
-                .into_iter()
-                .map(|v| v.into_track_info(self.id.clone(), cover.clone(), user_infos.clone()))
-                .collect(),
         }
     }
 }
 
-impl Into<TrackCollectionDetail> for BiliVideoDetail {
-    fn into(self) -> TrackCollectionDetail {
-        let user_details: Vec<UserDetail> = vec![self.author]
+impl Into<PlaylistDetail> for BiliVideoDetail {
+    fn into(self) -> PlaylistDetail {
+        let user_details: Vec<ArtistDetail> = vec![self.author]
             .into_iter()
             .chain(self.partner.into_iter().flatten())
             .map(|i| i.into())
             .collect();
-        let user_infos: Vec<UserInfo> = user_details
+        let user_infos: Vec<Artist> = user_details
             .iter()
-            .map(|i| i.info.clone().unwrap())
+            .map(|i| i.artist.clone().unwrap())
             .collect();
         let cover = Image::from(self.cover_url);
-        TrackCollectionDetail {
+        PlaylistDetail {
             id: self.id.clone(),
             provider: Provider::Bilibili.into(),
             name: self.title,
-            authors: user_details,
+            artists: user_details,
             cover: Some(cover.clone()),
             description: Some(self.description),
             tracks: self
@@ -294,8 +294,8 @@ impl Into<TrackCollectionDetail> for BiliVideoDetail {
 }
 
 impl BiliVideoDetailItem {
-    fn into_track_info(self, bvid: String, cover: Image, artists: Vec<UserInfo>) -> TrackInfo {
-        TrackInfo {
+    fn into_track_info(self, bvid: String, cover: Image, artists: Vec<Artist>) -> Track {
+        Track {
             id: trackid_from(bvid, self.cid.to_string()),
             provider: Provider::Bilibili.into(),
             name: self.title,
@@ -305,7 +305,7 @@ impl BiliVideoDetailItem {
     }
 }
 
-#[derive(Debug, Deserialize_repr, PartialEq)]
+#[derive(Debug, Clone, Deserialize_repr, PartialEq)]
 #[repr(u32)]
 enum AudioQuality {
     Bps64k = 30216,
@@ -340,7 +340,7 @@ struct BiliDashStream {
     dolby: BiliDolbyDash,
     flac: Option<BiliFlacDash>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct BiliAudioDash {
     #[serde(rename = "id")]
     quality: AudioQuality,
@@ -364,9 +364,7 @@ const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleW
 
 #[derive(Debug)]
 pub struct BiliScraper {
-    // TODO(xylonx): add rate limit to restrict: https://github.com/seanmonstar/reqwest/issues/491
-    client: reqwest::Client,
-    service: RateLimit<Client>,
+    client: LimitedRequestClient,
 }
 
 fn trackid_from(bvid: String, cid: String) -> String {
@@ -385,24 +383,28 @@ fn trackid_into(id: String) -> Result<(String, String)> {
 }
 
 impl BiliScraper {
-    pub async fn default(cookie_store: Arc<impl CookieStore + 'static>) -> Result<Self> {
-        Self::new(cookie_store, 10).await
-    }
-
-    pub async fn new(
+    pub async fn try_new(
         cookie_store: Arc<impl CookieStore + 'static>,
-        limit_per_sec: u64,
+        channel_buffer_size: usize,
+        request_buffer_size: usize,
+        max_concurrency_number: usize,
+        rate_limit_number: u64,
+        rate_limit_duration: Duration,
     ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .cookie_provider(cookie_store)
             .build()?;
 
-        let mut scraper = Self {
-            service: tower::ServiceBuilder::new()
-                .rate_limit(limit_per_sec, Duration::from_secs(1))
-                .service(client.clone()),
-            client,
+        let scraper = Self {
+            client: LimitedRequestClient::new(
+                client,
+                channel_buffer_size,
+                request_buffer_size,
+                max_concurrency_number,
+                rate_limit_number,
+                rate_limit_duration,
+            ),
         };
 
         let username = scraper.update_token().await?;
@@ -411,7 +413,7 @@ impl BiliScraper {
         Ok(scraper)
     }
 
-    async fn update_token(&mut self) -> Result<String> {
+    async fn update_token(&self) -> Result<String> {
         #[derive(Debug, Deserialize)]
         struct Status {
             #[serde(rename = "isLogin")]
@@ -421,9 +423,7 @@ impl BiliScraper {
         }
 
         let resp = self
-            .service
-            .ready()
-            .await?
+            .client
             .call(Request::new(
                 Method::GET,
                 Url::parse("https://api.bilibili.com/x/web-interface/nav")?,
@@ -442,9 +442,13 @@ impl BiliScraper {
     async fn get_suggest(&self, keyword: String) -> Result<Vec<BiliSuggestItem>> {
         Ok(self
             .client
-            .get("https://s.search.bilibili.com/main/suggest")
-            .query(&[("term", keyword)])
-            .send()
+            .call(Request::new(
+                Method::GET,
+                Url::parse_with_params(
+                    "https://s.search.bilibili.com/main/suggest",
+                    &[("term", keyword)],
+                )?,
+            ))
             .await
             .with_context(|| "[Bili] get suggest failed")?
             .json::<HashMap<String, BiliSuggestItem>>()
@@ -455,12 +459,12 @@ impl BiliScraper {
             .collect())
     }
 
-    async fn search(
+    async fn bsearch(
         &self,
         keyword: &String,
         page: i32,
         stype: SearchType,
-    ) -> Result<Vec<SearchItem>> {
+    ) -> Result<Vec<search_item::Item>> {
         let typ = match stype {
             SearchType::User => "bili_user",
             SearchType::Video => "video",
@@ -468,15 +472,17 @@ impl BiliScraper {
 
         let data = self
             .client
-            .get(format!(
-                "https://api.bilibili.com/x/web-interface/search/type"
+            .call(Request::new(
+                Method::GET,
+                Url::parse_with_params(
+                    "https://api.bilibili.com/x/web-interface/search/type",
+                    &[
+                        ("search_type", &typ.to_string()),
+                        ("keyword", keyword),
+                        ("page", &page.to_string()),
+                    ],
+                )?,
             ))
-            .query(&[
-                ("search_type", &typ.to_string()),
-                ("keyword", keyword),
-                ("page", &page.to_string()),
-            ])
-            .send()
             .await
             .with_context(|| "[Bili] send search request failed")?
             .json::<BiliResponse<BiliSearchResponse>>()
@@ -491,14 +497,14 @@ impl BiliScraper {
 
         futures::future::try_join_all(data.result.iter().map(|i| async move {
             match i {
-                BiliSearchResultItem::User(u) => Ok(SearchItem::from(u.clone())),
+                BiliSearchResultItem::User(u) => Ok(search_item::Item::from(u.clone())),
                 BiliSearchResultItem::Video(v) => {
                     // get detail to check whether the video is a playlist
                     let vdetail = self.video_detail(v.id.clone()).await?;
-                    if vdetail.video_numbers == 1 {
-                        Ok(SearchItem::Track(vdetail.into()))
+                    if vdetail.video_number == 1 {
+                        Ok(search_item::Item::Track(vdetail.into()))
                     } else {
-                        Ok(SearchItem::Playlist(vdetail.into()))
+                        Ok(search_item::Item::Playlist(vdetail.into()))
                     }
                 }
             }
@@ -507,62 +513,58 @@ impl BiliScraper {
     }
 
     async fn video_detail(&self, id: String) -> Result<BiliVideoDetail> {
-        let resp = self
+        Ok(self
             .client
-            .get("https://api.bilibili.com/x/web-interface/view")
-            .query(&[("bvid", &id)])
-            .send()
+            .call(Request::new(
+                Method::GET,
+                Url::parse_with_params(
+                    "https://api.bilibili.com/x/web-interface/view",
+                    &[("bvid", &id)],
+                )?,
+            ))
             .await
             .with_context(|| format!("[Bili][id={}] send video detail request failed", &id))?
             .json::<BiliResponse<BiliVideoDetail>>()
             .await
-            .with_context(|| format!("[Bili][id={}] parse to VideoDetail failed", &id))?;
-        if resp.code != 0 {
-            bail!("search video detail failed: {}", resp.message);
-        }
-        return Ok(resp.data);
-    }
-
-    async fn user_detail(&self, id: String) -> Result<BiliUser> {
-        let resp = self
-            .client
-            .get("https://api.bilibili.com/x/space/acc/info")
-            .query(&[("mid", id)])
-            .send()
-            .await?
-            .json::<BiliResponse<BiliUser>>()
-            .await?;
-        if resp.code != 0 {
-            bail!("search user detail failed: {}", resp.message);
-        }
-        return Ok(resp.data);
+            .with_context(|| format!("[Bili][id={}] parse to VideoDetail failed", &id))
+            .and_then(|v| {
+                (v.code == 0)
+                    .then_some(v.data)
+                    .ok_or_else(|| anyhow!("search video detail failed: {}", v.message))
+            })?)
     }
 
     async fn video_stream(&self, id: String) -> Result<Vec<BiliAudioDash>> {
         let (bvid, cid) = trackid_into(id)?;
         let resp = self
             .client
-            .get("https://api.bilibili.com/x/player/playurl")
-            .query(&[
-                ("bvid", bvid),
-                ("cid", cid),
-                ("fnval", (16 | 256).to_string()),
-            ]) // 16 for dash while 256 for dolby
-            .send()
+            .call(Request::new(
+                Method::GET,
+                Url::parse_with_params(
+                    "https://api.bilibili.com/x/player/playurl",
+                    &[
+                        ("bvid", &bvid),
+                        ("cid", &cid),
+                        ("fnval", &(16 | 256).to_string()),
+                    ],
+                )?,
+            ))
             .await?
             .json::<BiliResponse<BiliVideoStream>>()
-            .await?;
-        if resp.code != 0 {
-            bail!("search user detail failed: {}", resp.message);
-        }
+            .await
+            .with_context(|| format!("[Bili][bvid={}][cid={}] get stream failed", &bvid, &cid))
+            .and_then(|v| {
+                (v.code == 0)
+                    .then_some(v.data)
+                    .ok_or_else(|| anyhow!("search video detail failed: {}", v.message))
+            })?;
 
         Ok(resp
-            .data
             .dash
             .audio
             .into_iter()
-            .chain(resp.data.dash.dolby.audio.into_iter().flatten())
-            .chain(resp.data.dash.flac.into_iter().map(|i| i.audio))
+            .chain(resp.dash.dolby.audio.into_iter().flatten())
+            .chain(resp.dash.flac.into_iter().map(|i| i.audio))
             .collect())
     }
 }
@@ -573,12 +575,15 @@ impl Scraper for BiliScraper {
         Provider::Bilibili
     }
 
-    async fn suggest(&self, keyword: String) -> Result<Vec<String>> {
+    async fn suggest(&self, keyword: String) -> Result<Vec<Suggestion>> {
         Ok(self
             .get_suggest(keyword)
             .await?
             .into_iter()
-            .map(|v| v.value)
+            .map(|v| Suggestion {
+                provider: self.provider().into(),
+                suggestion: v.value,
+            })
             .collect())
     }
 
@@ -586,13 +591,10 @@ impl Scraper for BiliScraper {
         &self,
         keyword: String,
         page: i32,
-        fields: Vec<SearchZone>,
+        fields: Vec<Zone>,
     ) -> Result<Vec<SearchItem>> {
         for zone in fields.iter() {
-            if matches!(zone, SearchZone::Album) {
-                bail!("search zone album not supported for Bilibili");
-            }
-            if matches!(zone, SearchZone::Unspecified) {
+            if matches!(zone, Zone::Unspecified) {
                 bail!("unknown search zone: {:?}", zone);
             }
         }
@@ -601,55 +603,72 @@ impl Scraper for BiliScraper {
             let k = keyword.clone();
             async move {
                 match zone {
-                    SearchZone::Track | SearchZone::Playlist => self
-                        .search(&k, page, SearchType::Video)
+                    Zone::Track => Ok(self
+                        .bsearch(&k, page, SearchType::Video)
                         .await
-                        .with_context(|| "[Bili] search video failed"),
-                    SearchZone::Artist => self
-                        .search(&k, page, SearchType::User)
+                        .with_context(|| "[Bili] search video failed")?
+                        .into_iter()
+                        .filter(|v| matches!(v, search_item::Item::Track(_)))
+                        .collect()),
+                    Zone::Artist => Ok(self
+                        .bsearch(&k, page, SearchType::User)
                         .await
-                        .with_context(|| "[Bili] search artist failed"),
-                    SearchZone::Album => bail!("search zone album not supported for Bilibili"),
-                    SearchZone::Unspecified => bail!("unknown search zone: {:?}", zone),
+                        .with_context(|| "[Bili] search artist failed")?),
+                    Zone::Playlist => Ok(self
+                        .bsearch(&k, page, SearchType::Video)
+                        .await
+                        .with_context(|| "[Bili] search video failed")?
+                        .into_iter()
+                        .filter(|v| matches!(v, search_item::Item::Playlist(_)))
+                        .collect()),
+                    Zone::Unspecified => bail!("unknown search zone: {:?}", zone),
                 }
             }
         }))
         .await?
         .into_iter()
         .flatten()
+        .map(|v| SearchItem { item: Some(v) })
         .collect())
     }
 
-    async fn detail(&self, id: String, zone: SearchZone) -> Result<DetailItem> {
+    async fn detail(&self, id: String, zone: Zone) -> Result<DetailItem> {
         match zone {
-            SearchZone::Track => self
-                .video_detail(trackid_into(id)?.0)
-                .await
-                .map(|t| DetailItem::Track(t.into())),
-            SearchZone::Playlist => self
-                .video_detail(id)
-                .await
-                .map(|t| DetailItem::Playlist(t.into())),
-            SearchZone::Artist => self
-                .user_detail(id)
-                .await
-                .map(|u| DetailItem::User(u.into())),
-            SearchZone::Album => bail!("detail zone album not supported for Bilibili"),
-            SearchZone::Unspecified => bail!("unknown detail zone: {:?}", zone),
+            Zone::Playlist => self.video_detail(id).await.map(|t| DetailItem {
+                item: Some(detail_item::Item::Playlist(t.into())),
+            }),
+            Zone::Unspecified => bail!("unknown detail zone: {:?}", zone),
+            _ => bail!("[Bilibili] detail zone {:?} not supported", zone),
         }
     }
 
-    async fn stream(&self, id: String) -> Result<Vec<Stream>> {
+    async fn stream(&self, id: String) -> Result<Vec<StreamItem>> {
         Ok(self
             .video_stream(id)
             .await?
             .into_iter()
-            .map(|s| Stream {
-                provider: Provider::Bilibili.into(),
-                quality: s.quality.into(),
-                base_url: s.base_url,
-                backup_url: s.backup_url,
+            .map(|s| {
+                let q = s.quality;
+                let backup = s.backup_url;
+                vec![StreamItem {
+                    audio: Some(Stream {
+                        provider: Provider::Bilibili.into(),
+                        quality: q.clone().into(),
+                        url: s.base_url,
+                    }),
+                    video: None,
+                }]
+                .into_iter()
+                .chain(backup.into_iter().map(move |i| StreamItem {
+                    audio: Some(Stream {
+                        provider: Provider::Bilibili.into(),
+                        quality: q.clone().into(),
+                        url: i,
+                    }),
+                    video: None,
+                }))
             })
+            .flatten()
             .collect())
     }
 }
