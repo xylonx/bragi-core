@@ -27,28 +27,147 @@ pub mod netease;
 pub mod spotify;
 pub mod youtube;
 
-use anyhow::Result;
+use std::sync::Arc;
+
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
+use dashmap::DashMap;
+use log::{error, info};
 
 use crate::bragi::{
-    detail_replay::detail_item::Item as DetailItem, search_replay::search_item::Item as SearchItem,
-    Provider, SearchZone, Stream,
+    detail_response::DetailItem, search_response::SearchItem, stream_response::StreamItem,
+    suggest_response::Suggestion, DetailRequest, DetailResponse, Provider, SearchRequest,
+    SearchResponse, StreamRequest, StreamResponse, SuggestRequest, SuggestResponse, Zone,
 };
 
+// Scraper - scrape data from provider. any errors occurred when scraping MUST throw out and be handled by ScraperManager.
 #[async_trait]
 pub trait Scraper {
     fn provider(&self) -> Provider;
 
-    async fn suggest(&self, keyword: String) -> Result<Vec<String>>;
+    async fn suggest(&self, keyword: String) -> Result<Vec<Suggestion>>;
 
-    async fn search(
-        &self,
-        keyword: String,
-        page: i32,
-        fields: Vec<SearchZone>,
-    ) -> Result<Vec<SearchItem>>;
+    /// For search, when the fields contains unsupported SearchZone,
+    /// it should not throw an error. Instead, it should just notice user and handle the remaining ones
+    async fn search(&self, keyword: String, page: i32, zones: Vec<Zone>)
+        -> Result<Vec<SearchItem>>;
 
-    async fn detail(&self, id: String, zone: SearchZone) -> Result<DetailItem>;
+    // Now detail just support ZONE::PLAYLIST. Maybe support other zone like artist to list all works about the artists
+    async fn detail(&self, id: String, zone: Zone) -> Result<DetailItem>;
 
-    async fn stream(&self, id: String) -> Result<Vec<Stream>>;
+    async fn stream(&self, id: String) -> Result<Vec<StreamItem>>;
+}
+
+#[derive(Default)]
+pub struct ScraperManager {
+    scrapers: Arc<DashMap<Provider, Box<dyn Scraper + Send + Sync>>>,
+}
+
+impl ScraperManager {
+    pub fn new() -> Self {
+        Self {
+            scrapers: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn add_scraper<T: Scraper + 'static + Send + Sync>(&mut self, scraper: T) {
+        info!("add scraper {:?}", scraper.provider());
+        self.scrapers.insert(scraper.provider(), Box::new(scraper));
+    }
+}
+
+impl ScraperManager {
+    pub async fn suggest(&self, req: SuggestRequest) -> Result<SuggestResponse> {
+        if req.providers.is_empty() {
+            bail!("[ScraperManager] providers MUST be provided but is nil.");
+        }
+
+        Ok(SuggestResponse {
+            suggestions: futures::future::join_all(req.providers().map(|p| {
+                let keywords = req.keyword.clone();
+                async move {
+                    self.scrapers
+                        .get(&p)
+                        .ok_or_else(|| {
+                            anyhow!("[ScraperManager] provider {:?} not enabled now", p)
+                        })?
+                        .suggest(keywords)
+                        .await
+                }
+            }))
+            .await
+            .into_iter()
+            .filter_map(|i| {
+                if i.is_err() {
+                    error!("[ScraperManager] failed to scrape search result: {:?}", i);
+                }
+                i.ok()
+            })
+            .flatten()
+            .collect(),
+        })
+    }
+
+    pub async fn search(&self, req: SearchRequest) -> Result<SearchResponse> {
+        if req.providers.is_empty() {
+            bail!("[ScraperManager] providers MUST be provided but is nil.");
+        }
+
+        let zones = req.fields().collect::<Vec<_>>();
+
+        Ok(SearchResponse {
+            items: futures::future::join_all(req.providers().map(|p| {
+                let keyword = req.keyword.clone();
+                let zones = zones.clone();
+                async move {
+                    self.scrapers
+                        .get(&p)
+                        .ok_or_else(|| {
+                            anyhow!("[ScraperManager] provider {:?} not enabled now", p)
+                        })?
+                        .search(keyword, req.page, zones)
+                        .await
+                }
+            }))
+            .await
+            .into_iter()
+            .filter_map(|i| {
+                if i.is_err() {
+                    error!("[ScraperManager] failed to scrape search result: {:?}", i);
+                }
+                i.ok()
+            })
+            .flatten()
+            .collect(),
+        })
+    }
+
+    pub async fn detail(&self, req: DetailRequest) -> Result<DetailResponse> {
+        let zone = req.zone();
+        Ok(DetailResponse {
+            item: Some(
+                self.scrapers
+                    .get(&req.provider())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "[ScraperManager] provider {:?} not enabled now",
+                            req.provider()
+                        )
+                    })?
+                    .detail(req.id, zone)
+                    .await?,
+            ),
+        })
+    }
+
+    pub async fn stream(&self, req: StreamRequest) -> Result<StreamResponse> {
+        Ok(StreamResponse {
+            streams: self
+                .scrapers
+                .get(&req.provider())
+                .unwrap()
+                .stream(req.id)
+                .await?,
+        })
+    }
 }
