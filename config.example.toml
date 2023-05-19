@@ -1,0 +1,37 @@
+[server]
+addr = "0.0.0.0:6000"
+
+[provider]
+
+[provider.spotify]
+enabled = true
+
+username = ""
+password = ""
+
+client_id = ""
+client_secret = ""
+
+cache_dir = ""
+static_dir = ""
+
+[provider.bilibili]
+enabled = true
+cookie_path = ""
+
+request_buffer_size = 128
+max_concurrency_number = 8
+limit_request_per_seconds = 8
+
+[provider.netease]
+enabled = false
+cookie_path = ""
+instance = "https://netease-cloud-music-api-git-master-xylonx.vercel.app"
+
+request_buffer_size = 32
+max_concurrency_number = 4
+limit_request_per_seconds = 8
+
+[provider.youtube]
+enabled = true
+instance = "https://invidious.esmailelbob.xyz"
