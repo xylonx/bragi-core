@@ -1,0 +1,21 @@
+[application]
+host = "0.0.0.0"
+port = 6000
+tokens = ["T0keN__01"]
+
+[netease]
+enabled = true
+# deploy based on https://github.com/Binaryify/NeteaseCloudMusicApi
+instance = ""
+cookie_path = ".cache/netease/cookie.json"
+
+[youtube]
+enabled = true
+# invidous instance
+instance = "https://vid.puffyan.us"
+
+[bilibili]
+enabled = true
+cookie_path = ".cache/bili/cookie.json"
+wbi_path = ".cache/bili/wbi.json"
+enable_dolby = false
