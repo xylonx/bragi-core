@@ -1,0 +1,8 @@
+/target
+
+# ingore local cache, like cookie
+.cache/
+
+# ignore local setting files except example one
+settings*.toml
+!settings.example.toml
